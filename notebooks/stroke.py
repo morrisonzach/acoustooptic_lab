@@ -21,14 +21,37 @@ import matplotlib.pyplot as plt
 from scipy.signal import butter, sosfiltfilt
 from scipy.special import j0, j1
 from scipy.optimize import brentq
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import butter, sosfiltfilt
+from scipy.special import j0, j1
+from scipy.optimize import brentq
+import sys
+from scipy.optimize import curve_fit as fit
+from scipy.signal import periodogram, hilbert
+sys.path.append("../")
+from analysis import System
+ 
+def wave(t, A, phi, offset):
+    return np.abs(A) * np.sin(109e3 * 2 * np.pi * t - phi) + offset
+def interference(x, A, offset):
+    return np.abs(A) * np.power(np.cos(x * np.pi / 2 / 1064e-9), 2) + offset
+def find_nearest(array, value):
+    array = np.asarray(array)
+    idx = (np.abs(array - value)).argmin()
+    return array[idx]
+def find_idx(array, value):
+    array = np.asarray(array)
+    idx = (np.abs(array - value)).argmin()
+    return idx
 
 # ---------------- settings ----------------
-LAMBDA     = 1064e-9   # laser wavelength (m)
+LAMBDA     = 1064e-9    # laser wavelength (m)
 F_DRIVE    = 109e3      # nominal drive frequency (Hz); refined per trace
 FS_OUT     = 50e3       # sample rate after decimation (Hz); keep 2*F_DRIVE aliasing far from LP_CUT
 LP_CUT     = 2000.0     # bandwidth of slow and demodulated signals (Hz); must exceed the fastest fringe rate
 TRIM       = 0.005      # s discarded at each end (filter transients)
-G          = 1          # gain of 109 kHz path relative to DC. MEASURE THIS (detector roll-off etc.)
+G          = 1.0        # gain of 109 kHz path relative to DC. MEASURE THIS (detector roll-off etc.)
 SIN2_MIN   = 0.3        # only use points with sin^2(phi) above this in the S fit
 MIN_SWEEPS = 2          # trace must cross a full half-fringe at least this many times
 MAX_DF     = 100.0      # max |actual - nominal| drive frequency searched (Hz)
@@ -53,7 +76,14 @@ def beta_from_ratio(R):
 def analyze(t, x):
     t = np.asarray(t, float)
     x = np.asarray(x, float)
+    if t.size < 2 or t.size != x.size:
+        raise ValueError(f"empty or mismatched trace (len t={t.size}, len x={x.size})")
     fs = 1.0 / np.median(np.diff(t))
+    if not np.isfinite(fs) or fs <= 0:
+        raise ValueError(f"bad time axis (sample rate computed as {fs}); is t in seconds?")
+    if fs < 4 * F_DRIVE:
+        raise ValueError(f"sample rate {fs:.3g} Hz is too low for a {F_DRIVE:.3g} Hz drive; "
+                         f"is t in seconds?")
     n = max(1, int(round(fs / FS_OUT)))
     m = (len(x) // n) * n
     x, t = x[:m], t[:m]
@@ -68,6 +98,9 @@ def analyze(t, x):
 
     keep = (td > td[0] + TRIM) & (td < td[-1] - TRIM)
     z, s, td = z[keep], s[keep], td[keep]
+    if z.size < 64:
+        raise ValueError(f"trace too short: {x.size} samples at {fs:.3g} Hz = "
+                         f"{x.size / fs * 1e3:.2f} ms, need well over {2 * TRIM * 1e3:.0f} ms")
 
     # refine drive frequency: z^2 removes the sign flips of sin(phi), leaving a pure rotation
     # (spectral peak of z^2 sits at 2*df; zero-padded FFT is robust to noise)
@@ -124,17 +157,27 @@ def load(cals, idx, ch):
     return np.asarray(d.t, float), np.array(d.x, dtype=float, copy=True)
 
 
-def run_all(cals, voltages, files_per_voltage=3, channels=(0, 1), show=True):
-    results = []
+def run_all(cals, voltages, files_per_voltage=3, channels=(0, 1), show=True, index_of=None):
+    """index_of(vi, f) -> file index in `cals` for voltage number vi, repeat f.
+    Default assumes the repeats of each voltage are consecutive files."""
+    if index_of is None:
+        index_of = lambda vi, f: files_per_voltage * vi + f
+    results, failed = [], []
     for vi, V in enumerate(voltages):
         ncol = files_per_voltage * len(channels)
         if show:
             fig, ax = plt.subplots(2, ncol, figsize=(5 * ncol, 9), squeeze=False)
         k = 0
         for f in range(files_per_voltage):
-            idx = files_per_voltage * vi + f
+            idx = index_of(vi, f)
             for ch in channels:
-                r = analyze(*load(cals, idx, ch))
+                try:
+                    r = analyze(*load(cals, idx, ch))
+                except (ValueError, IndexError) as e:
+                    failed.append((V, idx, ch, str(e)))
+                    print(f"skipped V={V} idx={idx} ch={ch}: {e}")
+                    k += 1
+                    continue
                 r.update(V=V, idx=idx, ch=ch)
                 results.append(r)
                 if show:
@@ -160,6 +203,8 @@ def run_all(cals, voltages, files_per_voltage=3, channels=(0, 1), show=True):
             fig.suptitle(f"Calibration scan, piezo driven at {V} Vpp")
             plt.tight_layout()
             plt.show()
+    if failed:
+        print(f"{len(failed)} trace(s) skipped; see messages above")
     return results
 
 
@@ -170,7 +215,7 @@ def summarize(results, show=True):
         print(f"{r['V']:>5} {r['idx']:>4} {r['ch']:>3} {r['B']:>9.4f} {r['S']:>10.3e} "
               f"{r['R']:>10.3e} {r['stroke_pp']*1e9:>9.4f} {r['sweeps']:>6} "
               f"{r['snr']:>6.1f} {r['ext_ratio']:>5.2f}  {'yes' if r['usable'] else 'no'}")
-    Vs = sorted({r["V"] for r in results})
+    Vs = sorted({r["V"] for r in results}, key=float)
     mean, sem = [], []
     for V in Vs:
         vals = np.array([r["stroke_pp"] for r in results if r["V"] == V and r["usable"]])
@@ -179,10 +224,10 @@ def summarize(results, show=True):
     if show:
         plt.figure(figsize=(6, 4))
         for ch, mk in ((0, "o"), (1, "s")):
-            pts = [(r["V"], r["stroke_pp"] * 1e9) for r in results if r["ch"] == ch and r["usable"]]
+            pts = [(float(r["V"]), r["stroke_pp"] * 1e9) for r in results if r["ch"] == ch and r["usable"]]
             if pts:
                 plt.plot(*zip(*pts), mk, alpha=0.4, label=f"ch {ch}")
-        plt.errorbar(Vs, np.array(mean) * 1e9, yerr=np.array(sem) * 1e9, fmt="k-", capsize=3,
+        plt.errorbar([float(V) for V in Vs], np.array(mean) * 1e9, yerr=np.array(sem) * 1e9, fmt="k-", capsize=3,
                      label="mean ± SEM")
         plt.xlabel("Drive (Vpp)")
         plt.ylabel("Peak-to-peak stroke (nm)")
@@ -191,32 +236,169 @@ def summarize(results, show=True):
         plt.show()
     return Vs, mean, sem
 
-import numpy as np
-import sys
-import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit as fit
-from scipy.signal import periodogram, hilbert
-sys.path.append("../")
-from analysis import System
-
-def wave(t, A, phi, offset):
-    return np.abs(A) * np.sin(109e3 * 2 * np.pi * t - phi) + offset
-def interference(x, A, offset):
-    return np.abs(A) * np.power(np.cos(x * np.pi / 2 / 1064e-9), 2) + offset
-def find_nearest(array, value):
-    array = np.asarray(array)
-    idx = (np.abs(array - value)).argmin()
-    return array[idx]
-def find_idx(array, value):
-    array = np.asarray(array)
-    idx = (np.abs(array - value)).argmin()
-    return idx
-
-voltages = ["1", "2", "3", "4", "5", "5.5", "6", "6.5", "7", "7.5", "8", "8.5", "9", "9.5", "10"]
-cals = System("michelson", ["../../data/20261006/2nd/piezo_char_" + voltages[v] + "V_109kHz_calibration/iter_" + str(i) + ".tdms" for v in range(len(voltages)) for i in range(0, 3)], set_data = True, channel = "X")
 
 # Usage (fresh kernel, unfiltered data):
-results = run_all(cals, voltages, show = False)
-Vs, mean, sem = summarize(results)
-print(mean)
-print(sem)
+#   results = run_all(cals, voltages)
+#   Vs, mean, sem = summarize(results)
+#
+# If your file list is ordered repeat-major, e.g.
+#   [f"...{count}vpp.../iter_{y}.tdms" for y in range(29) for count in range(1, 11)]
+# then file index = y*10 + (voltage number), so pass:
+#   results = run_all(cals, voltages, files_per_voltage=29,
+#                     index_of=lambda vi, f: f * len(voltages) + vi)
+
+
+# =====================================================================
+# SHORT-TRACE (ENSEMBLE) METHOD
+# For traces too short for the stage to move during the capture (e.g. 16000 samples
+# at 25 MHz = 0.64 ms). Each short trace is a snapshot at one fixed fringe phase phi:
+#   DC level         c = C + Bs*cos(phi)
+#   109 kHz amplitude A = S*|sin(phi)|
+# Eliminating phi across many snapshots with different phi:
+#   A^2 = S^2 * (1 - (c - C)^2 / Bs^2)        (a downward parabola in c)
+# Fitting A^2 = a0 + a1*c + a2*c^2 gives  R = S/Bs = sqrt(-a2)  directly:
+# the curvature alone sets the ratio, so the snapshots do NOT need to reach the
+# fringe extremes, only to spread over a good part of the fringe.
+# Requirement: phi must differ between snapshots (stage moved or drifted between captures).
+# =====================================================================
+MIN_COVERAGE = 0.5   # snapshots' DC levels must span at least this fraction of the full fringe (2*Bs)
+N_BOOT       = 500   # bootstrap resamples for the uncertainty
+
+
+def analyze_short(t, x):
+    """Fit x = a*cos(wt) + b*sin(wt) + c + d*(t - tmean) to one short snapshot."""
+    t = np.asarray(t, float)
+    x = np.asarray(x, float)
+    if t.size < 2 or t.size != x.size:
+        raise ValueError(f"empty or mismatched trace (len t={t.size}, len x={x.size})")
+    fs = 1.0 / np.median(np.diff(t))
+    if not np.isfinite(fs) or fs < 4 * F_DRIVE:
+        raise ValueError(f"bad sample rate {fs}; is t in seconds?")
+    if (t[-1] - t[0]) * F_DRIVE < 10:
+        raise ValueError("snapshot shorter than 10 drive cycles")
+    w = 2 * np.pi * F_DRIVE
+    tc = t - t.mean()
+    M = np.column_stack([np.cos(w * t), np.sin(w * t), np.ones_like(t), tc])
+    coef, *_ = np.linalg.lstsq(M, x, rcond=None)
+    a, b, c, _ = coef
+    resid = x - M @ coef
+    sigma2 = np.mean(resid ** 2)
+    A2 = a * a + b * b
+    bias = 4 * sigma2 / x.size          # noise contribution to A^2 (var(a) + var(b))
+    return dict(c=c, A2=A2 - bias, A=np.sqrt(A2), bias=bias)
+
+
+def _parabola_R(c, A2):
+    a2, a1, a0 = np.polyfit(c, A2, 2)
+    if a2 >= 0:
+        return np.nan, np.nan, np.nan
+    R = np.sqrt(-a2)                    # S / Bs
+    C = -a1 / (2 * a2)
+    S2 = a0 - a1 ** 2 / (4 * a2)
+    Bs = np.sqrt(S2) / R if S2 > 0 else np.nan
+    return R, C, Bs
+
+
+def ensemble_fit(snaps, rng=None):
+    rng = np.random.default_rng(0) if rng is None else rng
+    c = np.array([s["c"] for s in snaps])
+    A2 = np.array([s["A2"] for s in snaps])
+    R, C, Bs = _parabola_R(c, A2)
+    boots = []
+    for _ in range(N_BOOT):
+        i = rng.integers(0, c.size, c.size)
+        Rb = _parabola_R(c[i], A2[i])[0]
+        if np.isfinite(Rb):
+            boots.append(Rb)
+    R_err = np.std(boots, ddof=1) if len(boots) > 10 else np.nan
+    coverage = (c.max() - c.min()) / (2 * Bs) if np.isfinite(Bs) else np.nan
+    if np.isfinite(R):
+        beta = beta_from_ratio(R / G)
+        pp = beta * LAMBDA / (2 * np.pi)
+        pp_err = pp * (R_err / R) if np.isfinite(R_err) else np.nan
+    else:
+        beta = pp = pp_err = np.nan
+    usable = (np.isfinite(R) and np.isfinite(coverage) and coverage >= MIN_COVERAGE
+              and np.isfinite(R_err) and R_err < 0.5 * R)
+    return dict(R=R, R_err=R_err, C=C, B=Bs, beta=beta, stroke_pp=pp, stroke_err=pp_err,
+                coverage=coverage, n=c.size, c=c, A2=A2, usable=usable)
+
+
+def run_short(cals, voltages, n_iter, channels=(0, 1), index_of=None, show=True):
+    """index_of(vi, it) -> file index. Default matches a list built as
+    [... for it in range(n_iter) for V in voltages]  (repeat-major), i.e. it*len(voltages) + vi."""
+    if index_of is None:
+        index_of = lambda vi, it: it * len(voltages) + vi
+    out = []
+    for vi, V in enumerate(voltages):
+        for ch in channels:
+            snaps = []
+            for it in range(n_iter):
+                idx = index_of(vi, it)
+                try:
+                    snaps.append(analyze_short(*load(cals, idx, ch)))
+                except (ValueError, IndexError) as e:
+                    print(f"skipped V={V} idx={idx} ch={ch}: {e}")
+            if len(snaps) < 6:
+                print(f"V={V} ch={ch}: only {len(snaps)} snapshots, need >= 6")
+                continue
+            r = ensemble_fit(snaps)
+            r.update(V=V, ch=ch)
+            out.append(r)
+
+    print(f"{'V':>5} {'ch':>3} {'n':>3} {'B (V)':>9} {'S/B':>10} {'±':>9} {'pp (nm)':>9} "
+          f"{'±':>8} {'cover':>6}  use")
+    for r in out:
+        print(f"{r['V']:>5} {r['ch']:>3} {r['n']:>3} {r['B']:>9.4f} {r['R']:>10.3e} "
+              f"{r['R_err']:>9.2e} {r['stroke_pp']*1e9:>9.4f} {r['stroke_err']*1e9:>8.4f} "
+              f"{r['coverage']:>6.2f}  {'yes' if r['usable'] else 'no'}")
+
+    if show and out:
+        n = len(out)
+        ncol = min(n, 6)
+        nrow = int(np.ceil(n / ncol))
+        fig, ax = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.5 * nrow), squeeze=False)
+        for k, r in enumerate(out):
+            a = ax[k // ncol][k % ncol]
+            a.plot(r["c"], r["A2"] * 1e6, "o", ms=3)
+            if np.isfinite(r["R"]):
+                cc = np.linspace(r["C"] - r["B"], r["C"] + r["B"], 200)
+                a.plot(cc, (r["R"] * r["B"]) ** 2 * (1 - ((cc - r["C"]) / r["B"]) ** 2) * 1e6, "k")
+            a.set_title(f"{r['V']} Vpp ch{r['ch']}  {'OK' if r['usable'] else 'REJECT'}", fontsize=9)
+            a.set_xlabel("DC level c (V)")
+            a.set_ylabel("A² (mV²)")
+        for k in range(n, nrow * ncol):
+            ax[k // ncol][k % ncol].axis("off")
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure(figsize=(6, 4))
+        for ch, mk in ((0, "o"), (1, "s")):
+            pts = [r for r in out if r["ch"] == ch and r["usable"]]
+            if pts:
+                plt.errorbar([float(r["V"]) for r in pts], [r["stroke_pp"] * 1e9 for r in pts],
+                             yerr=[r["stroke_err"] * 1e9 for r in pts], fmt=mk, capsize=3,
+                             label=f"ch {ch}")
+        plt.xlabel("Drive (Vpp)")
+        plt.ylabel("Peak-to-peak stroke (nm)")
+        if plt.gca().get_legend_handles_labels()[0]:
+            plt.legend()
+        plt.tight_layout()
+        plt.show()
+    return out
+
+voltages = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+n_iter = 29
+cals = System("michelson",
+              ["../../data/20251215/stroke_dist_" + str(count) + "vpp_109kHz/iter_" + str(y) + ".tdms"
+               for count in range(1, 11) for y in range(n_iter)],
+              set_data=True, channel="X")
+
+out = run_short(cals, voltages, n_iter=n_iter,
+                index_of=lambda vi, it: vi * n_iter + it)
+
+for r in out:
+    print(r["V"], r["ch"], r["stroke_pp"], r["stroke_err"], r["usable"])
+# Usage for short snapshots (your file list is repeat-major: for y in range(29) for count in range(1, 11)):
+#   out = run_short(cals, voltages, n_iter=29)
+#   for r in out: print(r["V"], r["ch"], r["stroke_pp"], r["stroke_err"], r["usable"])
